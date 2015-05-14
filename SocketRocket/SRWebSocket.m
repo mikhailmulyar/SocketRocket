@@ -45,7 +45,7 @@
 #endif
 
 #if !__has_feature(objc_arc) 
-#error SocketRocket muust be compiled with ARC enabled
+#error SocketRocket must be compiled with ARC enabled
 #endif
 
 
@@ -135,6 +135,7 @@ static NSString *newSHA1String(const char *bytes, size_t length) {
 @end
 
 NSString *const SRWebSocketErrorDomain = @"SRWebSocketErrorDomain";
+NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
 
 // Returns number of bytes consumed. Returning 0 means you didn't match.
 // Sends bytes to callback handler;
@@ -306,7 +307,7 @@ static __strong NSData *CRLFCRLF;
     _consumerPool = [[SRIOConsumerPool alloc] init];
     
     _scheduledRunloops = [[NSMutableSet alloc] init];
-    
+
     [self _initializeStreams];
     
     // default handlers
@@ -370,7 +371,7 @@ static __strong NSData *CRLFCRLF;
                         });
 	}
     
-    [self _connect];
+    [self _sr_connect];
 }
 
 // Calls block on delegate queue
@@ -417,13 +418,12 @@ static __strong NSData *CRLFCRLF;
     
     if (responseCode >= 400) {
         SRFastLog(@"Request failed with response code %d", responseCode);
-        [self _failWithError:[NSError errorWithDomain:@"org.lolrus.SocketRocket" code:2132 userInfo:[NSDictionary dictionaryWithObject:[NSString stringWithFormat:@"received bad response code from server %ld", (long)responseCode] forKey:NSLocalizedDescriptionKey]]];
+        [self _failWithError:[NSError errorWithDomain:SRWebSocketErrorDomain code:2132 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"received bad response code from server %ld", (long)responseCode], SRHTTPResponseErrorKey: @(responseCode)}]];
         return;
-
     }
     
     if(![self _checkHandshake:_receivedHTTPHeaders]) {
-        [self _failWithError:[NSError errorWithDomain:SRWebSocketErrorDomain code:2133 userInfo:[NSDictionary dictionaryWithObject:[NSString stringWithFormat:@"Invalid Sec-WebSocket-Accept response"] forKey:NSLocalizedDescriptionKey]]];
+        [self _failWithError:[NSError errorWithDomain:SRWebSocketErrorDomain code:2133 userInfo:@{NSLocalizedDescriptionKey: @"Invalid Sec-WebSocket-Accept response"}]];
         return;
     }
     
@@ -431,7 +431,7 @@ static __strong NSData *CRLFCRLF;
     if (negotiatedProtocol) {
         // Make sure we requested the protocol
         if ([_requestedProtocols indexOfObject:negotiatedProtocol] == NSNotFound) {
-            [self _failWithError:[NSError errorWithDomain:SRWebSocketErrorDomain code:2133 userInfo:[NSDictionary dictionaryWithObject:[NSString stringWithFormat:@"Server specified Sec-WebSocket-Protocol that wasn't requested"] forKey:NSLocalizedDescriptionKey]]];
+            [self _failWithError:[NSError errorWithDomain:SRWebSocketErrorDomain code:2133 userInfo:@{NSLocalizedDescriptionKey: @"Server specified Sec-WebSocket-Protocol that wasn't requested"}]];
             return;
         }
         
@@ -473,7 +473,12 @@ static __strong NSData *CRLFCRLF;
 - (void)didConnect
 {
     SRFastLog(@"Connected");
-    CFHTTPMessageRef request = CFHTTPMessageCreateRequest(NULL, CFSTR("GET"), (__bridge CFURLRef)_url, kCFHTTPVersion1_1);
+
+    NSString *httpMethod = _urlRequest.HTTPMethod;
+    CFHTTPMessageRef request = CFHTTPMessageCreateRequest(NULL, (__bridge CFStringRef)httpMethod, (__bridge CFURLRef)_url, kCFHTTPVersion1_1);
+
+    NSData *bodyData = _urlRequest.HTTPBody;
+    CFHTTPMessageSetBody( request, (__bridge CFDataRef)bodyData );
     
     // Set host first so it defaults
     CFHTTPMessageSetHeaderFieldValue(request, CFSTR("Host"), (__bridge CFStringRef)(_url.port ? [NSString stringWithFormat:@"%@:%@", _url.host, _url.port] : _url.host));
@@ -533,16 +538,21 @@ static __strong NSData *CRLFCRLF;
         
         [_outputStream setProperty:(__bridge id)kCFStreamSocketSecurityLevelNegotiatedSSL forKey:(__bridge id)kCFStreamPropertySocketSecurityLevel];
         
-        // If we're using pinned certs, don't validate the certificate chain
-        if ([_urlRequest SR_SSLPinnedCertificates].count) {
+        // If we're using pinned or anchor certs, don't validate the certificate chain
+        if ([_urlRequest SR_SSLPinnedCertificates].count > 0 ||
+            [_urlRequest SR_SSLAnchorCertificates].count > 0) {
+
             [SSLOptions setValue:[NSNumber numberWithBool:NO] forKey:(__bridge id)kCFStreamSSLValidatesCertificateChain];
-        }
-        
+
+        } else {
+            // We have to use system certificate chain, but will disable it for debug builds.
 #if DEBUG
-        [SSLOptions setValue:[NSNumber numberWithBool:NO] forKey:(__bridge id)kCFStreamSSLValidatesCertificateChain];
-        NSLog(@"SocketRocket: In debug mode.  Allowing connection to any root cert");
+            [SSLOptions setValue:[NSNumber numberWithBool:NO] forKey:(__bridge id)kCFStreamSSLValidatesCertificateChain];
+            NSLog(@"SocketRocket: In debug mode.  Allowing connection to any root cert");
 #endif
-        
+        }
+
+
         [_outputStream setProperty:SSLOptions
                             forKey:(__bridge id)kCFStreamPropertySSLSettings];
     }
@@ -551,7 +561,7 @@ static __strong NSData *CRLFCRLF;
     _outputStream.delegate = self;
 }
 
-- (void)_connect;
+- (void)_sr_connect;
 {
     if (!_scheduledRunloops.count) {
         [self scheduleInRunLoop:[NSRunLoop SR_networkRunLoop] forMode:NSDefaultRunLoopMode];
@@ -583,7 +593,7 @@ static __strong NSData *CRLFCRLF;
     [self closeWithCode:SRStatusCodeNormal reason:nil];
 }
 
-- (void)closeWithCode:(SRStatusCode)code reason:(NSString *)reason;
+- (void)closeWithCode:(NSInteger)code reason:(NSString *)reason;
 {
     assert(code);
     dispatch_async(_workQueue, ^{
@@ -613,11 +623,7 @@ static __strong NSData *CRLFCRLF;
             
             NSUInteger usedLength = 0;
             
-            BOOL success = [reason getBytes:(char *)mutablePayload.mutableBytes + sizeof(uint16_t) maxLength:payload.length - sizeof(uint16_t) usedLength:&usedLength encoding:NSUTF8StringEncoding options:NSStringEncodingConversionExternalRepresentation range:NSMakeRange(0, reason.length) remainingRange:&remainingRange];
-
-            if(!success){
-                assert(success);
-            }
+            [reason getBytes:(char *)mutablePayload.mutableBytes + sizeof(uint16_t) maxLength:payload.length - sizeof(uint16_t) usedLength:&usedLength encoding:NSUTF8StringEncoding options:NSStringEncodingConversionExternalRepresentation range:NSMakeRange(0, reason.length) remainingRange:&remainingRange];
             assert(remainingRange.length == 0);
 
             if (usedLength != maxMsgSize) {
@@ -646,17 +652,16 @@ static __strong NSData *CRLFCRLF;
     dispatch_async(_workQueue, ^{
         if (self.readyState != SR_CLOSED) {
             _failed = YES;
+            self.readyState = SR_CLOSED;
+            [self _scheduleCleanup];
+
+            SRFastLog(@"Failing with error %@", error.localizedDescription);
             [self _performDelegateBlock:^{
                 if ([self.delegate respondsToSelector:@selector(webSocket:didFailWithError:)]) {
                     [self.delegate webSocket:self didFailWithError:error];
                 }
             }];
 
-            self.readyState = SR_CLOSED;
-            [self _scheduleCleanup];
-
-            SRFastLog(@"Failing with error %@", error.localizedDescription);
-            
             [self _disconnect];
         }
     });
@@ -672,6 +677,7 @@ static __strong NSData *CRLFCRLF;
     [_outputBuffer appendData:data];
     [self _pumpWriting];
 }
+
 - (void)send:(id)data;
 {
     NSAssert(self.readyState != SR_CONNECTING, @"Invalid State: Cannot call send: until connection is open");
@@ -687,6 +693,16 @@ static __strong NSData *CRLFCRLF;
         } else {
             assert(NO);
         }
+    });
+}
+
+- (void)sendPing:(NSData *)data;
+{
+    NSAssert(self.readyState == SR_OPEN, @"Invalid State: Cannot call send: until connection is open");
+    // TODO: maybe not copy this for performance
+    data = [data copy] ?: [NSData data]; // It's okay for a ping to be empty
+    dispatch_async(_workQueue, ^{
+        [self _sendFrameWithOpcode:SROpCodePing data:data];
     });
 }
 
@@ -707,9 +723,14 @@ static __strong NSData *CRLFCRLF;
     }];
 }
 
-- (void)handlePong;
+- (void)handlePong:(NSData *)pongData;
 {
-    // NOOP
+    SRFastLog(@"Received pong");
+    [self _performDelegateBlock:^{
+        if ([self.delegate respondsToSelector:@selector(webSocket:didReceivePong:)]) {
+            [self.delegate webSocket:self didReceivePong:pongData];
+        }
+    }];
 }
 
 - (void)_handleMessage:(id)message
@@ -839,7 +860,7 @@ static inline BOOL closeCodeIsValid(int closeCode) {
             [self handlePing:frameData];
             break;
         case SROpCodePong:
-            [self handlePong];
+            [self handlePong:frameData];
             break;
         default:
             [self _closeWithProtocolError:[NSString stringWithFormat:@"Unknown opcode %ld", (long)opcode]];
@@ -1003,7 +1024,6 @@ static const uint8_t SRPayloadLenMask   = 0x7F;
                     assert(header.payload_length < 126 && header.payload_length >= 0);
                 }
                 
-                
                 if (header.masked) {
                     assert(data.length >= sizeof(_currentReadMaskOffset) + offset);
                     memcpy(self->_currentReadMaskKey, ((uint8_t *)mapped_buffer) + offset, sizeof(self->_currentReadMaskKey));
@@ -1037,7 +1057,7 @@ static const uint8_t SRPayloadLenMask   = 0x7F;
     if (dataLength - _outputBufferOffset > 0 && _outputStream.hasSpaceAvailable) {
         NSInteger bytesWritten = [_outputStream write:_outputBuffer.bytes + _outputBufferOffset maxLength:dataLength - _outputBufferOffset];
         if (bytesWritten == -1) {
-            [self _failWithError:[NSError errorWithDomain:@"org.lolrus.SocketRocket" code:2145 userInfo:[NSDictionary dictionaryWithObject:@"Error writing to stream" forKey:NSLocalizedDescriptionKey]]];
+            [self _failWithError:[NSError errorWithDomain:SRWebSocketErrorDomain code:2145 userInfo:@{NSLocalizedDescriptionKey: @"Error writing to stream"}]];
              return;
         }
         
@@ -1065,6 +1085,9 @@ static const uint8_t SRPayloadLenMask   = 0x7F;
         }
         
         if (!_failed) {
+            // Make sure state is closed
+            self.readyState = SR_CLOSED;
+
             [self _performDelegateBlock:^{
                 if ([self.delegate respondsToSelector:@selector(webSocket:didCloseWithCode:reason:wasClean:)]) {
                     [self.delegate webSocket:self didCloseWithCode:_closeCode reason:_closeReason wasClean:YES];
@@ -1296,7 +1319,11 @@ static const size_t SRFrameHeaderOverhead = 32;
 {
     [self assertOnWorkQueue];
     
-    NSAssert(data == nil || [data isKindOfClass:[NSData class]] || [data isKindOfClass:[NSString class]], @"Function expects nil, NSString or NSData");
+    if (nil == data) {
+        return;
+    }
+    
+    NSAssert([data isKindOfClass:[NSData class]] || [data isKindOfClass:[NSString class]], @"NSString or NSData");
     
     size_t payloadLength = [data isKindOfClass:[NSString class]] ? [(NSString *)data lengthOfBytesUsingEncoding:NSUTF8StringEncoding] : [data length];
         
@@ -1327,6 +1354,8 @@ static const size_t SRFrameHeaderOverhead = 32;
         unmasked_payload = (uint8_t *)[data bytes];
     } else if ([data isKindOfClass:[NSString class]]) {
         unmasked_payload =  (const uint8_t *)[data UTF8String];
+    } else {
+        return;
     }
     
     if (payloadLength < 126) {
@@ -1370,16 +1399,19 @@ static const size_t SRFrameHeaderOverhead = 32;
     
     if (_secure && !_pinnedCertFound && (eventCode == NSStreamEventHasBytesAvailable || eventCode == NSStreamEventHasSpaceAvailable)) {
         
-        NSArray *sslCerts = [_urlRequest SR_SSLPinnedCertificates];
-        if (sslCerts) {
-            SecTrustRef secTrust = (__bridge SecTrustRef)[aStream propertyForKey:(__bridge id)kCFStreamPropertySSLPeerTrust];
-            if (secTrust) {
-                NSInteger numCerts = SecTrustGetCertificateCount(secTrust);
+        NSArray *sslPinnedCerts = [_urlRequest SR_SSLPinnedCertificates];
+        NSArray *sslAnchorCerts = [_urlRequest SR_SSLAnchorCertificates];
+
+        // If we have any pinned certificates, should prefer them and ignore anything else.
+        if (sslPinnedCerts.count > 0) {
+            SecTrustRef trust = (__bridge SecTrustRef)[aStream propertyForKey:(__bridge id)kCFStreamPropertySSLPeerTrust];
+            if (trust) {
+                NSInteger numCerts = SecTrustGetCertificateCount(trust);
                 for (NSInteger i = 0; i < numCerts && !_pinnedCertFound; i++) {
-                    SecCertificateRef cert = SecTrustGetCertificateAtIndex(secTrust, i);
+                    SecCertificateRef cert = SecTrustGetCertificateAtIndex(trust, i);
                     NSData *certData = CFBridgingRelease(SecCertificateCopyData(cert));
                     
-                    for (id ref in sslCerts) {
+                    for (id ref in sslPinnedCerts) {
                         SecCertificateRef trustedCert = (__bridge SecCertificateRef)ref;
                         NSData *trustedCertData = CFBridgingRelease(SecCertificateCopyData(trustedCert));
                         
@@ -1393,8 +1425,32 @@ static const size_t SRFrameHeaderOverhead = 32;
             
             if (!_pinnedCertFound) {
                 dispatch_async(_workQueue, ^{
-                    NSDictionary *userInfo = @{ NSLocalizedDescriptionKey : @"Invalid server cert" };
-                    [weakSelf _failWithError:[NSError errorWithDomain:@"org.lolrus.SocketRocket" code:23556 userInfo:userInfo]];
+                    [weakSelf _failWithError:[NSError errorWithDomain:@"org.lolrus.SocketRocket" code:23556 userInfo:@{NSLocalizedDescriptionKey: @"Invalid server cert"}]];
+                });
+                return;
+            }
+        }
+        // If we have anchor certificates, must use them instead of the system ones.
+        else if (sslAnchorCerts.count > 0) {
+
+            SecTrustRef trust = (__bridge SecTrustRef)[aStream propertyForKey:(__bridge id)kCFStreamPropertySSLPeerTrust];
+            if (trust) {
+
+                SecTrustSetAnchorCertificates(trust, (__bridge CFArrayRef)sslAnchorCerts);
+                SecTrustSetAnchorCertificatesOnly(trust, true);
+
+                SecTrustResultType result;
+                OSStatus status = SecTrustEvaluate(trust, &result);
+
+                if (status == errSecSuccess && (result == kSecTrustResultProceed || result == kSecTrustResultUnspecified)) {
+                    // Certificate is signed by one of the anchors, allow it for this connection.
+                    _pinnedCertFound = YES;
+                }
+            }
+
+            if (!_pinnedCertFound) {
+                dispatch_async(_workQueue, ^{
+                    [self _failWithError:[NSError errorWithDomain:SRWebSocketErrorDomain code:23556 userInfo:@{NSLocalizedDescriptionKey: @"Invalid server cert"}]];
                 });
                 return;
             }
@@ -1568,23 +1624,38 @@ static const size_t SRFrameHeaderOverhead = 32;
 
 @implementation  NSURLRequest (CertificateAdditions)
 
-- (NSArray *)SR_SSLPinnedCertificates;
+- (NSArray *)SR_SSLPinnedCertificates
 {
     return [NSURLProtocol propertyForKey:@"SR_SSLPinnedCertificates" inRequest:self];
+}
+
+- (NSArray *)SR_SSLAnchorCertificates
+{
+    return [NSURLProtocol propertyForKey:@"SR_SSLAnchorCertificates" inRequest:self];
 }
 
 @end
 
 @implementation  NSMutableURLRequest (CertificateAdditions)
 
-- (NSArray *)SR_SSLPinnedCertificates;
+- (NSArray *)SR_SSLPinnedCertificates
 {
     return [NSURLProtocol propertyForKey:@"SR_SSLPinnedCertificates" inRequest:self];
 }
 
-- (void)setSR_SSLPinnedCertificates:(NSArray *)SR_SSLPinnedCertificates;
+- (void)setSR_SSLPinnedCertificates:(NSArray *)SR_SSLPinnedCertificates
 {
     [NSURLProtocol setProperty:SR_SSLPinnedCertificates forKey:@"SR_SSLPinnedCertificates" inRequest:self];
+}
+
+- (NSArray *)SR_SSLAnchorCertificates
+{
+    return [NSURLProtocol propertyForKey:@"SR_SSLAnchorCertificates" inRequest:self];
+}
+
+- (void)setSR_SSLAnchorCertificates:(NSArray *)SR_SSLAnchorCertificates
+{
+    [NSURLProtocol setProperty:SR_SSLAnchorCertificates forKey:@"SR_SSLAnchorCertificates" inRequest:self];
 }
 
 @end
@@ -1688,7 +1759,7 @@ static inline int32_t validate_dispatch_data_partial_string(NSData *data) {
     for (int i = 0; i < maxCodepointSize; i++) {
         NSString *str = [[NSString alloc] initWithBytesNoCopy:(char *)data.bytes length:data.length - i encoding:NSUTF8StringEncoding freeWhenDone:NO];
         if (str) {
-            return data.length - i;
+            return (int32_t)(data.length - i);
         }
     }
     

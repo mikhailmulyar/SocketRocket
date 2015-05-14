@@ -17,14 +17,14 @@
 #import <Foundation/Foundation.h>
 #import <Security/SecCertificate.h>
 
-typedef enum {
+typedef NS_ENUM(NSInteger, SRReadyState) {
     SR_CONNECTING   = 0,
     SR_OPEN         = 1,
     SR_CLOSING      = 2,
     SR_CLOSED       = 3,
-} SRReadyState;
+};
 
-typedef enum {
+typedef enum SRStatusCode : NSInteger {
     SRStatusCodeNormal = 1000,
     SRStatusCodeGoingAway = 1001,
     SRStatusCodeProtocolError = 1002,
@@ -40,6 +40,7 @@ typedef enum {
 @class SRWebSocket;
 
 extern NSString *const SRWebSocketErrorDomain;
+extern NSString *const SRHTTPResponseErrorKey;
 
 #pragma mark - SRWebSocketDelegate
 
@@ -79,10 +80,13 @@ extern NSString *const SRWebSocketErrorDomain;
 - (void)open;
 
 - (void)close;
-- (void)closeWithCode:(SRStatusCode)code reason:(NSString *)reason;
+- (void)closeWithCode:(NSInteger)code reason:(NSString *)reason;
 
 // Send a UTF8 String or Data.
 - (void)send:(id)data;
+
+// Send Data (can be nil) in a ping message.
+- (void)sendPing:(NSData *)data;
 
 @end
 
@@ -99,7 +103,8 @@ extern NSString *const SRWebSocketErrorDomain;
 - (void)webSocket:(SRWebSocket *)webSocket didReceivePing:(id)ping;
 - (void)webSocketDidOpen:(SRWebSocket *)webSocket;
 - (void)webSocket:(SRWebSocket *)webSocket didFailWithError:(NSError *)error;
-- (void)webSocket:(SRWebSocket *)webSocket didCloseWithCode:(SRStatusCode)code reason:(NSString *)reason wasClean:(BOOL)wasClean;
+- (void)webSocket:(SRWebSocket *)webSocket didCloseWithCode:(NSInteger)code reason:(NSString *)reason wasClean:(BOOL)wasClean;
+- (void)webSocket:(SRWebSocket *)webSocket didReceivePong:(NSData *)pongPayload;
 
 @end
 
@@ -109,6 +114,11 @@ extern NSString *const SRWebSocketErrorDomain;
 
 @property (nonatomic, retain, readonly) NSArray *SR_SSLPinnedCertificates;
 
+// Unlike pinned certificates, anchors allow arbitrary certificates validation,
+// but only against the given anchors.
+// Should be an array of SecCertificateRef objects.
+@property (nonatomic, retain, readonly) NSArray *SR_SSLAnchorCertificates;
+
 @end
 
 #pragma mark - NSMutableURLRequest (CertificateAdditions)
@@ -116,6 +126,11 @@ extern NSString *const SRWebSocketErrorDomain;
 @interface NSMutableURLRequest (CertificateAdditions)
 
 @property (nonatomic, retain) NSArray *SR_SSLPinnedCertificates;
+
+// Unlike pinned certificates, anchors allow arbitrary certificates validation,
+// but only against the given anchors.
+// Should be an array of SecCertificateRef objects.
+@property (nonatomic, retain) NSArray *SR_SSLAnchorCertificates;
 
 @end
 
